@@ -130,8 +130,8 @@ async def walk_module(request_context, course_id, module, current_path):
     # 1. Download files directly in this module
     topics = module.get("Topics", [])
     for topic in topics:
-        # Type 1 represents a File topic (e.g. PDF, Word, PowerPoint)
-        if topic.get("Type") == 1:
+        # TypeIdentifier "File" or ActivityType 1 represents a File topic (e.g. PDF, Word, PowerPoint)
+        if topic.get("TypeIdentifier") == "File" or topic.get("ActivityType") == 1:
             await download_topic(request_context, course_id, topic, current_path)
             
     # 2. Traverse submodules recursively
