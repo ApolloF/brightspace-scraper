@@ -1,8 +1,16 @@
 import sys
+import io
 import asyncio
 from brightspace_sync.auth import login, check_auth
 from brightspace_sync.calendar import sync_calendar
 from brightspace_sync.downloader import sync_files
+
+# Reconfigure standard output streams to handle Unicode characters safely on Windows console
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, "buffer"):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 
 def print_help():
     print("=" * 60)

@@ -1,8 +1,17 @@
 import os
 import re
+import sys
+import io
 import urllib.parse
 from playwright.async_api import async_playwright
 from dotenv import load_dotenv
+
+# Reconfigure standard output streams to handle Unicode characters safely on Windows console
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, "buffer"):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 
 # Load configuration
 load_dotenv()
