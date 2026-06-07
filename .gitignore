@@ -1,0 +1,11 @@
+auth_state.json
+.env
+downloads/
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+*.log
+calendar_summary.md
+.venv/
+
