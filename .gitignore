@@ -8,4 +8,5 @@ __pycache__/
 *.log
 calendar_summary.md
 .venv/
-
+token.json
+credentials.json

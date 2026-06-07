@@ -74,8 +74,8 @@ async def download_topic(request_context, course_id, topic, course_dir):
     download_url = f"/d2l/api/le/1.26/{course_id}/content/topics/{topic_id}/file"
     
     try:
-        # Perform GET request to download the file
-        response = await request_context.get(download_url)
+        # Perform GET request to download the file (with 10-minute timeout for large files)
+        response = await request_context.get(download_url, timeout=600000)
         if response.status != 200:
             print(f"  [Failed] HTTP {response.status} for topic: {topic_title}")
             return
@@ -142,6 +142,47 @@ async def walk_module(request_context, course_id, module, current_path):
         # TypeIdentifier "File" or ActivityType 1 represents a File topic (e.g. PDF, Word, PowerPoint)
         if topic.get("TypeIdentifier") == "File" or topic.get("ActivityType") == 1:
             await download_topic(request_context, course_id, topic, current_path)
+            
+    # 1.5. Scrape and download files linked in the module's description html (e.g. quicklinks or content paths)
+    desc_dict = module.get("Description")
+    if desc_dict and desc_dict.get("Html"):
+        html_content = desc_dict.get("Html")
+        links = re.findall(r'href="([^"]+)"', html_content) + re.findall(r"href='([^']+)'", html_content)
+        for link in links:
+            normalized_link = link.replace("&amp;", "&")
+            is_coursefile = "type=coursefile" in normalized_link
+            is_enforced_content = "/content/enforced/" in normalized_link
+            
+            if is_coursefile or is_enforced_content:
+                download_url = normalized_link
+                filename = None
+                if is_coursefile:
+                    parsed_qs = urllib.parse.parse_qs(urllib.parse.urlparse(normalized_link).query)
+                    file_ids = parsed_qs.get("fileId") or parsed_qs.get("fileid")
+                    if file_ids:
+                        filename = os.path.basename(urllib.parse.unquote(file_ids[0]))
+                elif is_enforced_content:
+                    parsed_path = urllib.parse.urlparse(normalized_link).path
+                    filename = os.path.basename(urllib.parse.unquote(parsed_path))
+                    
+                if filename:
+                    filename = sanitize_name(filename)
+                    # We skip empty/invalid filenames
+                    if filename and filename != "unnamed":
+                        dest_path = os.path.join(current_path, filename)
+                        try:
+                            response = await request_context.get(download_url, timeout=600000)
+                            if response.status == 200:
+                                content = await response.body()
+                                content_size = len(content)
+                                # Check if file exists and has same size
+                                if os.path.exists(dest_path) and os.path.getsize(dest_path) == content_size:
+                                    continue
+                                with open(dest_path, "wb") as f:
+                                    f.write(content)
+                                print(f"  [Scraped Download] {filename} ({content_size / 1024:.1f} KB)")
+                        except Exception as e:
+                            print(f"  [Warning] Failed to download scraped link '{filename}': {e}")
             
     # 2. Traverse submodules recursively
     sub_modules = module.get("Modules", [])
