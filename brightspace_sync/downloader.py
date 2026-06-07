@@ -41,6 +41,25 @@ def get_extension_from_url(url):
     _, ext = os.path.splitext(path)
     return ext.lower() if ext else ""
 
+def get_extension_from_content_type(content_type):
+    """
+    Maps a MIME Content-Type to a file extension.
+    """
+    ct = content_type.lower()
+    if "pdf" in ct:
+        return ".pdf"
+    elif "msword" in ct or "officedocument.word" in ct:
+        return ".docx"
+    elif "powerpoint" in ct or "officedocument.presentation" in ct or "ms-powerpoint" in ct:
+        return ".pptx"
+    elif "excel" in ct or "officedocument.spreadsheet" in ct or "ms-excel" in ct:
+        return ".xlsx"
+    elif "zip" in ct:
+        return ".zip"
+    elif "html" in ct:
+        return ".html"
+    return ""
+
 def parse_content_disposition(header):
     """
     Parses the filename from the Content-Disposition header.
@@ -62,9 +81,80 @@ def parse_content_disposition(header):
         
     return None
 
+async def scrape_and_download_html_links(request_context, html_content, dest_dir):
+    """
+    Extracts enforced-content and coursefile links from an HTML string,
+    then downloads each discovered file to dest_dir.
+    Handles both relative (/content/enforced/...) and absolute (https://...) URLs.
+    """
+    links = re.findall(r'href="([^"]+)"', html_content) + re.findall(r"href='([^']+)'", html_content)
+    
+    for link in links:
+        # Normalize HTML entities
+        normalized = link.replace("&amp;", "&")
+        
+        is_coursefile = "type=coursefile" in normalized
+        is_enforced = "/content/enforced/" in normalized
+        
+        if not (is_coursefile or is_enforced):
+            continue
+        
+        # Determine filename from the URL
+        filename = None
+        if is_coursefile:
+            parsed_qs = urllib.parse.parse_qs(urllib.parse.urlparse(normalized).query)
+            file_ids = parsed_qs.get("fileId") or parsed_qs.get("fileid")
+            if file_ids:
+                # fileId may be a path like "Author/Week 1/filename.pdf" - take the basename
+                raw_name = urllib.parse.unquote(file_ids[0])
+                filename = sanitize_name(os.path.basename(raw_name))
+        elif is_enforced:
+            parsed_path = urllib.parse.urlparse(normalized).path
+            raw_name = urllib.parse.unquote(parsed_path)
+            filename = sanitize_name(os.path.basename(raw_name))
+        
+        if not filename or filename == "unnamed":
+            continue
+        
+        dest_path = os.path.join(dest_dir, filename)
+        
+        try:
+            response = await request_context.get(normalized, timeout=600000)
+            if response.status == 200:
+                content = await response.body()
+                content_size = len(content)
+                
+                # If filename has no extension, try to determine one from the response
+                if not os.path.splitext(filename)[1]:
+                    cd_header = response.headers.get("content-disposition", "")
+                    cd_filename = parse_content_disposition(cd_header)
+                    if cd_filename and os.path.splitext(cd_filename)[1]:
+                        filename = cd_filename
+                    else:
+                        ext = get_extension_from_url(normalized)
+                        if not ext:
+                            ext = get_extension_from_content_type(response.headers.get("content-type", ""))
+                        if ext:
+                            filename = filename + ext
+                    dest_path = os.path.join(dest_dir, filename)
+                
+                # Check if file exists and has same size
+                if os.path.exists(dest_path) and os.path.getsize(dest_path) == content_size:
+                    continue
+                os.makedirs(dest_dir, exist_ok=True)
+                with open(dest_path, "wb") as f:
+                    f.write(content)
+                print(f"  [Scraped Download] {filename} ({content_size / 1024:.1f} KB)")
+            else:
+                print(f"  [Warning] HTTP {response.status} for scraped link: {filename}")
+        except Exception as e:
+            print(f"  [Warning] Failed to download scraped link '{filename}': {e}")
+
 async def download_topic(request_context, course_id, topic, course_dir):
     """
     Downloads a single file topic from Brightspace.
+    If the topic is a small HTML redirect/wrapper page, also scrapes it for
+    embedded enforced-content/coursefile links and downloads those files too.
     """
     topic_id = topic.get("TopicId")
     topic_title = topic.get("Title", f"topic_{topic_id}")
@@ -85,25 +175,11 @@ async def download_topic(request_context, course_id, topic, course_dir):
         cd_header = response.headers.get("content-disposition")
         filename = parse_content_disposition(cd_header)
         
-        # 2. Fall back to topic Title + extension from Url
+        # 2. Fall back to topic Title + extension from Url or Content-Type
         if not filename:
             ext = get_extension_from_url(topic_url)
-            # If no extension in URL, try mapping Content-Type
             if not ext:
-                content_type = response.headers.get("content-type", "").lower()
-                if "pdf" in content_type:
-                    ext = ".pdf"
-                elif "msword" in content_type or "officedocument.word" in content_type:
-                    ext = ".docx"
-                elif "powerpoint" in content_type or "officedocument.presentation" in content_type:
-                    ext = ".pptx"
-                elif "excel" in content_type or "officedocument.spreadsheet" in content_type:
-                    ext = ".xlsx"
-                elif "zip" in content_type:
-                    ext = ".zip"
-                elif "html" in content_type:
-                    ext = ".html"
-            
+                ext = get_extension_from_content_type(response.headers.get("content-type", ""))
             filename = sanitize_name(topic_title) + ext
             
         dest_path = os.path.join(course_dir, filename)
@@ -117,14 +193,26 @@ async def download_topic(request_context, course_id, topic, course_dir):
             local_size = os.path.getsize(dest_path)
             if local_size == content_size:
                 # Same file size, skip download to optimize speed and network
-                return
-                
-        # Write/Overwrite file
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        with open(dest_path, "wb") as f:
-            f.write(content)
-            
-        print(f"  [Downloaded] {filename} ({content_size / 1024:.1f} KB)")
+                pass
+            else:
+                # Overwrite changed file
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                with open(dest_path, "wb") as f:
+                    f.write(content)
+                print(f"  [Downloaded] {filename} ({content_size / 1024:.1f} KB)")
+        else:
+            # Write new file
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            with open(dest_path, "wb") as f:
+                f.write(content)
+            print(f"  [Downloaded] {filename} ({content_size / 1024:.1f} KB)")
+        
+        # If the topic is a small HTML redirect/wrapper page, also scrape it for
+        # embedded links to actual course files (e.g. /content/enforced/ or coursefile links).
+        content_type = response.headers.get("content-type", "").lower()
+        if "html" in content_type and content_size < 50000:
+            html_text = content.decode("utf-8", errors="replace")
+            await scrape_and_download_html_links(request_context, html_text, course_dir)
         
     except Exception as e:
         print(f"  [Error] Failed to download topic {topic_title} ({topic_id}): {e}")
@@ -143,46 +231,11 @@ async def walk_module(request_context, course_id, module, current_path):
         if topic.get("TypeIdentifier") == "File" or topic.get("ActivityType") == 1:
             await download_topic(request_context, course_id, topic, current_path)
             
-    # 1.5. Scrape and download files linked in the module's description html (e.g. quicklinks or content paths)
+    # 1.5. Scrape and download files linked in the module's description HTML
+    # (e.g. quicklinks or /content/enforced/ paths embedded by instructors)
     desc_dict = module.get("Description")
     if desc_dict and desc_dict.get("Html"):
-        html_content = desc_dict.get("Html")
-        links = re.findall(r'href="([^"]+)"', html_content) + re.findall(r"href='([^']+)'", html_content)
-        for link in links:
-            normalized_link = link.replace("&amp;", "&")
-            is_coursefile = "type=coursefile" in normalized_link
-            is_enforced_content = "/content/enforced/" in normalized_link
-            
-            if is_coursefile or is_enforced_content:
-                download_url = normalized_link
-                filename = None
-                if is_coursefile:
-                    parsed_qs = urllib.parse.parse_qs(urllib.parse.urlparse(normalized_link).query)
-                    file_ids = parsed_qs.get("fileId") or parsed_qs.get("fileid")
-                    if file_ids:
-                        filename = os.path.basename(urllib.parse.unquote(file_ids[0]))
-                elif is_enforced_content:
-                    parsed_path = urllib.parse.urlparse(normalized_link).path
-                    filename = os.path.basename(urllib.parse.unquote(parsed_path))
-                    
-                if filename:
-                    filename = sanitize_name(filename)
-                    # We skip empty/invalid filenames
-                    if filename and filename != "unnamed":
-                        dest_path = os.path.join(current_path, filename)
-                        try:
-                            response = await request_context.get(download_url, timeout=600000)
-                            if response.status == 200:
-                                content = await response.body()
-                                content_size = len(content)
-                                # Check if file exists and has same size
-                                if os.path.exists(dest_path) and os.path.getsize(dest_path) == content_size:
-                                    continue
-                                with open(dest_path, "wb") as f:
-                                    f.write(content)
-                                print(f"  [Scraped Download] {filename} ({content_size / 1024:.1f} KB)")
-                        except Exception as e:
-                            print(f"  [Warning] Failed to download scraped link '{filename}': {e}")
+        await scrape_and_download_html_links(request_context, desc_dict.get("Html"), current_path)
             
     # 2. Traverse submodules recursively
     sub_modules = module.get("Modules", [])
