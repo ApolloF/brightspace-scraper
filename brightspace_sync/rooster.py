@@ -18,19 +18,19 @@ def extract_numbers(s):
 def matches_group(summary, user_groups):
     """
     Checks if an event summary matches any of the user's groups.
-    If the event is a group-specific class (e.g. gr.17, group 5, or mentorgroep 10-19),
+    If the event is a group-specific class (e.g. gr.17, group 5, tutorial gr01, tut. training gr.01a),
     returns True if the user is in that group, or False if they are in a different group.
-    If it's a general event (like a lecture/HC), returns True.
+    If it's a general event (like a lecture/HC/Q&A/exam), returns True.
     """
     summary_lower = summary.lower()
     
-    # If the summary doesn't mention "gr.", "groep", "group", or "werkgroep" / "wg",
-    # it is assumed to be a general event (e.g., lecture/HC) that everyone attends.
-    if not any(x in summary_lower for x in ["gr.", "group", "groep", "wg", "werkgroep"]):
+    # Check if the summary mentions a tutorial or group indicator
+    is_group_event = any(x in summary_lower for x in ["gr.", "group", "groep", "wg", "werkgroep", "tutorial", "tut."]) or bool(re.search(r'\bgr\d+', summary_lower))
+    if not is_group_event:
         return True
         
     # 1. Check for ranges, e.g. "mentorgroep 01-09" or "groep 10-19"
-    range_match = re.search(r'(?:mentorgroep|gr\.?|group|groep|wg|werkgroep)\s*(\d+)\s*-\s*(\d+)', summary_lower)
+    range_match = re.search(r'(?:mentorgroep|gr\.?|group|groep|wg|werkgroep|tutorial|tut\.?)\s*(\d+)\s*-\s*(\d+)', summary_lower)
     if range_match:
         start_g = int(range_match.group(1))
         end_g = int(range_match.group(2))
@@ -40,20 +40,29 @@ def matches_group(summary, user_groups):
                 return True
         return False
         
-    # 2. Check for specific group number/identifier, e.g. "gr.10" or "group 144" or "gr.9a"
-    gr_match = re.search(r'(?:gr\.?|group|groep|wg|werkgroep)\s*([a-zA-Z0-9\.]+)', summary_lower)
+    # 2. Check for specific group number/identifier, e.g. "gr.10", "tutorial gr01", "tut. training gr.01a"
+    gr_match = re.search(r'(?:gr\.?|group|groep|wg|werkgroep)\s*([a-zA-Z0-9\.\+]+)', summary_lower)
+    if not gr_match:
+        gr_match = re.search(r'(?:tutorial|tut\.?)\s*(?:training\s*)?(?:gr\.?\s*)?([a-zA-Z0-9\.\+]+)', summary_lower)
+        
     if gr_match:
         event_grp = gr_match.group(1).strip()
         # Clean leading zeros for pure numeric strings (e.g. '05' -> '5')
         event_grp_clean = event_grp.lstrip('0') if event_grp.isdigit() else event_grp
+        event_num_match = re.search(r'(\d+)', event_grp)
+        event_base_num = event_num_match.group(1).lstrip('0') if event_num_match else None
         
         for ug in user_groups:
             ug_lower = ug.lower()
-            # Extract alphanumeric tokens from the user group name
+            # If ug contains a dot like "3.8", the primary tutorial class group is the prefix before the dot
+            ug_base = ug_lower.split('.')[0].strip() if '.' in ug_lower else ug_lower
             ug_tokens = re.findall(r'[a-zA-Z0-9\.]+', ug_lower)
             ug_tokens_clean = [t.lstrip('0') if t.isdigit() else t for t in ug_tokens]
+            ug_nums = [str(n) for n in extract_numbers(ug_base)]
             
-            if event_grp_clean in ug_tokens_clean or event_grp in ug_tokens:
+            if (event_grp_clean in ug_tokens_clean or 
+                event_grp in ug_tokens or
+                (event_base_num and event_base_num in ug_nums)):
                 return True
         return False
         
@@ -104,17 +113,28 @@ async def get_user_groups_for_course(request_context, course_id, user_id):
 
 def get_academic_year():
     """
-    Determines the current academic year string.
-    Since we are in June 2026, the academic year for courses we sync is 2025-2026.
+    Determines the active academic year string for Rooster RUG.
+    Checks ROOSTER_ACADEMIC_YEAR env var first, then checks app-config.js,
+    then defaults to current academic year.
     """
-    # For simplicity and robustness, we can dynamic-detect or default to 2025-2026
-    # Let's inspect the current local time month.
-    # Academic years run from September of year X to September of year X+1.
+    env_year = os.getenv("ROOSTER_ACADEMIC_YEAR")
+    if env_year:
+        return env_year
+        
+    try:
+        cfg_url = "https://rooster.rug.nl/app-config.js"
+        req = urllib.request.Request(cfg_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as res:
+            cfg_text = res.read().decode("utf-8")
+            match = re.search(r'"currentYear"\s*:\s*"([^"]+)"', cfg_text)
+            if match:
+                return match.group(1)
+    except Exception:
+        pass
+        
     now = datetime.now()
-    if now.month >= 9:
-        return f"{now.year}-{now.year + 1}"
-    else:
-        return f"{now.year - 1}-{now.year}"
+    return f"{now.year}-{now.year + 1}" if now.month >= 9 else f"{now.year - 1}-{now.year}"
+
 
 async def scan_brightspace_groups(request_context, courses):
     """
@@ -149,9 +169,6 @@ def get_te_course_code(all_te_courses, course_code):
     Finds the exact course code object from the TimeEdit database for the course code.
     Returns the TimeEdit identifier string (e.g. "course-EBP023A05") or None.
     """
-    # The rooster.rug.nl courses list holds items like:
-    # {"code": "EBP023A05", "name": {"en": "", "nl": "Financial Accounting BDK"}}
-    # So we search for exact code matches, or case insensitive match.
     for c in all_te_courses:
         code_te = c.get("code", "")
         if code_te.lower() == course_code.lower():
@@ -159,16 +176,134 @@ def get_te_course_code(all_te_courses, course_code):
             
     return None
 
+def fetch_maat_schedule(year, courses, course_groups):
+    """
+    Fetches the schedule from the new RUG MAAT API for 2026-2027 and newer.
+    Applies group filtering for tutorials and returns standard event dictionaries.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        tz_ams = ZoneInfo("Europe/Amsterdam")
+    except ImportError:
+        tz_ams = timezone.utc
+
+    # 1. Search course offerings to find exact MAAT codes
+    course_offering_codes = []
+    course_name_map = {}
+    for c in courses:
+        clean_code = c.get("code", "").split('.')[0]
+        search_url = f"https://rooster.rug.nl/maat/api/{year}/course-offerings/search"
+        payload = json.dumps({"searchText": clean_code, "academicYear": year, "limit": 20}).encode("utf-8")
+        req = urllib.request.Request(search_url, data=payload, headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as res:
+                data = json.loads(res.read().decode("utf-8"))
+                for res_item in data.get("results", []):
+                    if res_item.get("courseCode") == clean_code:
+                        co_code = res_item.get("code")
+                        course_offering_codes.append(co_code)
+                        course_name_map[clean_code] = res_item.get("displayNameEn") or c.get("name")
+                        break
+        except Exception as e:
+            print(f"[Warning] Failed to search MAAT course offering for {clean_code}: {e}")
+            
+    if not course_offering_codes:
+        print("[ERROR] No course offerings found in MAAT.")
+        return [], "", ""
+        
+    print(f"Discovered MAAT course offering codes: {course_offering_codes}")
+    
+    # 2. Generate schedule
+    gen_url = f"https://rooster.rug.nl/maat/api/{year}/schedule/generate"
+    gen_payload = json.dumps({"objects": [], "courseOfferingCodes": course_offering_codes}).encode("utf-8")
+    gen_req = urllib.request.Request(gen_url, data=gen_payload, headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(gen_req, timeout=20) as res:
+            gen_data = json.loads(res.read().decode("utf-8"))
+            raw_results = gen_data.get("results", [])
+    except Exception as e:
+        print(f"[ERROR] Failed to generate MAAT schedule: {e}")
+        return [], "", ""
+        
+    print(f"Retrieved {len(raw_results)} total events from MAAT schedule.")
+    
+    # 3. Filter and parse events
+    filtered_events = []
+    for ev in raw_results:
+        cos = ev.get("courseOfferings", [])
+        if not cos:
+            continue
+        c_item = cos[0]
+        clean_code = c_item.get("courseCode", "")
+        c_name = course_name_map.get(clean_code, c_item.get("displayNameEn", ""))
+        
+        desc = ev.get("description", "").strip()
+        act = ev.get("activityType", {}).get("displayNameEn", "").strip()
+        
+        # Check if tutorial/group event
+        is_tut = "tutorial" in act.lower() or "tutorial" in desc.lower() or "werkcollege" in desc.lower() or "tut." in desc.lower()
+        user_groups = course_groups.get(clean_code, [])
+        if is_tut and user_groups:
+            # Check group match against description e.g. "Tutorial gr.03"
+            if not matches_group(desc, user_groups):
+                continue
+                
+        # Parse datetime into local timezone (Europe/Amsterdam)
+        st = ev.get("start")
+        et = ev.get("end") or st
+        dtstart = datetime(st[0], st[1], st[2], st[3], st[4], tzinfo=tz_ams)
+        dtend = datetime(et[0], et[1], et[2], et[3], et[4], tzinfo=tz_ams)
+        
+        rooms = ", ".join([r.get("code", "") for r in ev.get("rooms", []) if r.get("code")])
+        
+        filtered_events.append({
+            "summary": f"[{clean_code}] {c_name} {desc}",
+            "description": f"{act}: {desc}",
+            "location": rooms,
+            "uid": f"maat-{ev.get('id')}@rug.nl",
+            "course_code": clean_code,
+            "dtstart": dtstart,
+            "dtend": dtend,
+            "categories": ["Rooster", clean_code]
+        })
+        
+    filtered_events.sort(key=lambda x: x["dtstart"])
+    print(f"Filtered down to {len(filtered_events)} personalized {year} events via MAAT.")
+    
+    # 4. Save schedule in MAAT to obtain direct iCal subscription feed URL
+    direct_ical_url = ""
+    try:
+        save_url = f"https://rooster.rug.nl/maat/api/{year}/schedule"
+        save_payload = json.dumps({"objects": [], "courseOfferingCodes": course_offering_codes}).encode("utf-8")
+        save_req = urllib.request.Request(save_url, data=save_payload, headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(save_req, timeout=10) as s_res:
+            sched_uuid = json.loads(s_res.read().decode("utf-8"))
+            direct_ical_url = f"https://rooster.rug.nl/maat/api/{year}/schedule/{sched_uuid}"
+    except Exception as e:
+        print(f"[Warning] Failed to generate MAAT iCal link: {e}")
+        
+    joined_co = ",".join(course_offering_codes)
+    web_schedule_url = f"https://rooster.rug.nl/{year}?courseOffering={joined_co}"
+    return filtered_events, web_schedule_url, direct_ical_url
+
 def sync_personalized_schedule(course_groups, courses):
     """
     Downloads full calendars from rooster.rug.nl for all user courses,
-    applies group-filtering locally, and collects the list of excluded series.
-    Returns (filtered_events, web_schedule_url, direct_ical_url).
+    applies group-filtering locally, and returns (filtered_events, web_schedule_url, direct_ical_url).
+    Automatically routes to MAAT API for 2026-2027 and newer, or TimeEdit for older years.
     """
     year = get_academic_year()
     print(f"Using academic year for Rooster RUG: {year}")
     
-    # 1. Fetch complete TimeEdit course list
+    # Route to MAAT API for 2026-2027+
+    if year >= "2026-2027":
+        print("Using RUG MAAT timetable system for 2026-2027+...")
+        events, web_url, direct_url = fetch_maat_schedule(year, courses, course_groups)
+        if events:
+            return events, web_url, direct_url
+        print("[Warning] MAAT returned no events. Falling back to TimeEdit...")
+    
+    # Legacy TimeEdit flow
     catalog_url = f"https://rooster.rug.nl/api/course/{year}"
     try:
         req = urllib.request.Request(catalog_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -178,9 +313,9 @@ def sync_personalized_schedule(course_groups, courses):
         print(f"[ERROR] Failed to fetch course list from Rooster RUG: {e}")
         return [], "", ""
         
-    # 2. Map course codes to TimeEdit codes
+    # Map course codes to TimeEdit codes
     te_codes = []
-    mapped_courses = {} # clean_code -> course details
+    mapped_courses = {}
     
     for c in courses:
         raw_code = c.get("code", "")
@@ -196,7 +331,7 @@ def sync_personalized_schedule(course_groups, courses):
         
     print(f"Mapped {len(te_codes)} course(s) to TimeEdit codes: {te_codes}")
     
-    # 3. Fetch calendar events for each course individually
+    # Fetch calendar events for each course individually
     events_raw = []
     series_map = {}
     
@@ -207,7 +342,7 @@ def sync_personalized_schedule(course_groups, courses):
         if not te_code:
             continue
             
-        course_ical_url = f"https://rooster.rug.nl/api/ical2/en/current/{te_code}"
+        course_ical_url = f"https://rooster.rug.nl/api/ical2/en/{year}/{te_code}"
         print(f"Downloading schedule for {clean_code} from {course_ical_url}...")
         try:
             ical_req = urllib.request.Request(course_ical_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -257,42 +392,33 @@ def sync_personalized_schedule(course_groups, courses):
     excludes = []
     for course_code, series_dict in series_map.items():
         for series_id, match_list in series_dict.items():
-            # If all events in this series are non-matches for the user's group, exclude it!
             if not any(match_list):
                 excludes.append(series_id)
                 
     print(f"Identified {len(excludes)} series ID(s) to exclude: {excludes}")
     
-    # 5. Filter the events list locally
     filtered_events = []
     excludes_set = set(excludes)
     
     for ev in events_raw:
         if ev["series_id"] in excludes_set:
             continue
+        user_groups = course_groups.get(ev["course_code"], [])
+        if not matches_group(ev["summary"], user_groups):
+            continue
         filtered_events.append(ev)
         
     print(f"Filtered {len(events_raw)} events down to {len(filtered_events)} personalized events.")
     
-    # 6. Generate the URLs
-    # Format excluded series for the query parameter
-    # e.g., excludes are `#SPLUSC7D11A` -> URL-encoded as `%2523SPLUSC7D11A` and joined by `%2526`
-    # Wait, the Rooster UI url is:
-    # https://rooster.rug.nl/#/en/current/schedule/{joined_codes}/dataView=ical&excludeSeries={joined_excludes}
-    # where codes are joined by `&` and excludes are encoded and joined by `&` (double URL encoded)
-    
     joined_te_codes = "&".join(te_codes)
     joined_excludes = "&".join(excludes)
-    # Double encode for the hash route
     double_encoded_excludes = urllib.parse.quote(joined_excludes).replace("&", "%26")
     
-    web_schedule_url = f"https://rooster.rug.nl/#/en/current/schedule/{joined_te_codes}/dataView=ical&excludeSeries={double_encoded_excludes}"
+    web_schedule_url = f"https://rooster.rug.nl/#/en/{year}/schedule/{joined_te_codes}/dataView=ical&excludeSeries={double_encoded_excludes}"
     
-    # Direct iCal feed URL from Rooster RUG:
-    # https://rooster.rug.nl/api/ical2/en/current/{joined_codes}?excludes={excludes}
-    direct_ical_url = f"https://rooster.rug.nl/api/ical2/en/current/{joined_te_codes}"
+    direct_ical_url = f"https://rooster.rug.nl/api/ical2/en/{year}/{joined_te_codes}"
     if excludes:
-        # The excludes parameter is URL encoded
         direct_ical_url += f"?excludes={urllib.parse.quote(joined_excludes)}"
         
     return filtered_events, web_schedule_url, direct_ical_url
+

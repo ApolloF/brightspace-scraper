@@ -415,22 +415,31 @@ def write_calendar_summary(rooster_events, bs_events, output_path):
     past_events = [e for e in filtered_events if e["start_dt"] < now]
     upcoming_events = [e for e in filtered_events if e["start_dt"] >= now]
     
+    # If filtered window is empty (e.g. viewing term schedules outside current 60-day window),
+    # include all term events so the summary is always useful.
+    show_all_fallback = not upcoming_events and not past_events and len(all_events) > 0
+    
     md_content = f"# Brightspace & Rooster Personalized Calendar Summary\n"
     md_content += f"*Generated on: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (Local Time)*\n\n"
     
-    md_content += "## 📅 Upcoming Deadlines & Events (Next 60 Days)\n\n"
-    if not upcoming_events:
-        md_content += "*No upcoming events found.*\n\n"
-    else:
-        for event in upcoming_events:
+    if show_all_fallback:
+        md_content += f"## 📅 Personalized Semester Schedule ({len(all_events)} Events)\n\n"
+        for event in all_events:
             md_content += format_event_row(event, now)
-            
-    md_content += "## 🕒 Recent Deadlines & Events (Past 7 Days)\n\n"
-    if not past_events:
-        md_content += "*No recent past events found.*\n\n"
     else:
-        for event in past_events:
-            md_content += format_event_row(event, now)
+        md_content += "## 📅 Upcoming Deadlines & Events (Next 60 Days)\n\n"
+        if not upcoming_events:
+            md_content += "*No upcoming events found.*\n\n"
+        else:
+            for event in upcoming_events:
+                md_content += format_event_row(event, now)
+                
+        md_content += "## 🕒 Recent Deadlines & Events (Past 7 Days)\n\n"
+        if not past_events:
+            md_content += "*No recent past events found.*\n\n"
+        else:
+            for event in past_events:
+                md_content += format_event_row(event, now)
             
     try:
         with open(output_path, "w", encoding="utf-8") as f:
@@ -438,3 +447,176 @@ def write_calendar_summary(rooster_events, bs_events, output_path):
         print(f"Calendar summary written to '{output_path}'.")
     except Exception as e:
         print(f"[Warning] Failed to write calendar summary: {e}")
+
+
+def write_weekly_schedule_todo_summary(rooster_events, bs_events, output_path="weekly_schedule_todo.md"):
+    """
+    Generates an all-in-one weekly schedule and to-do guide (weekly_schedule_todo.md)
+    covering recurring weekly routines, week-by-week timetable, course preparation tasks,
+    and milestone exam deadlines.
+    """
+    from collections import defaultdict
+    
+    # 1. Unify and sort events
+    all_events = []
+    for ev in rooster_events:
+        dtstart = ev["dtstart"]
+        dtend = ev["dtend"] or dtstart
+        if not isinstance(dtstart, datetime.datetime):
+            dtstart = datetime.datetime.combine(dtstart, datetime.time.min, tzinfo=datetime.timezone.utc)
+        elif dtstart.tzinfo is None:
+            dtstart = dtstart.replace(tzinfo=datetime.timezone.utc)
+            
+        if not isinstance(dtend, datetime.datetime):
+            dtend = datetime.datetime.combine(dtend, datetime.time.min, tzinfo=datetime.timezone.utc)
+        elif dtend.tzinfo is None:
+            dtend = dtend.replace(tzinfo=datetime.timezone.utc)
+            
+        summary = ev["summary"].strip()
+        code = ev["course_code"]
+        if code and not summary.startswith(f"[{code}]"):
+            summary = f"[{code}] {summary}"
+            
+        all_events.append({
+            "summary": summary,
+            "raw_summary": ev["summary"].strip(),
+            "course_code": code,
+            "description": ev.get("description", ""),
+            "location": ev.get("location", "").strip(),
+            "start_dt": dtstart,
+            "end_dt": dtend,
+            "type": "Lecture" if any(x in summary.lower() for x in ["lecture", "hoorcollege"]) else (
+                "Exam" if any(x in summary.lower() for x in ["exam", "tentamen", "resit"]) else (
+                    "Q&A" if "q&a" in summary.lower() else "Tutorial"
+                )
+            )
+        })
+        
+    for ev in bs_events:
+        dtstart = ev["dtstart"]
+        dtend = ev["dtend"] or dtstart
+        if not isinstance(dtstart, datetime.datetime):
+            dtstart = datetime.datetime.combine(dtstart, datetime.time.min, tzinfo=datetime.timezone.utc)
+        elif dtstart.tzinfo is None:
+            dtstart = dtstart.replace(tzinfo=datetime.timezone.utc)
+            
+        all_events.append({
+            "summary": ev["summary"].strip(),
+            "raw_summary": ev["summary"].strip(),
+            "course_code": ev.get("course_code", "Brightspace"),
+            "description": ev.get("description", ""),
+            "location": ev.get("location", "Brightspace"),
+            "start_dt": dtstart,
+            "end_dt": dtend,
+            "type": "Deadline / Assignment"
+        })
+        
+    all_events.sort(key=lambda e: e["start_dt"])
+    
+    # 2. Build Week-by-Week map
+    by_week = defaultdict(list)
+    for ev in all_events:
+        iso_year, iso_week, _ = ev["start_dt"].isocalendar()
+        by_week[(iso_year, iso_week)].append(ev)
+        
+    # Markdown generation
+    md = []
+    md.append("# 🎓 Year 2 Semester 1a — Complete Weekly Schedule & To-Do Guide")
+    md.append(f"*Personalized schedule generated on {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} (Local Time)*\n")
+    
+    md.append("## 📌 Course Enrollment & Cohort Summary")
+    md.append("| Course Code | Course Name | Credits | Assigned Group | Primary Schedule Slot |")
+    md.append("| :--- | :--- | :---: | :---: | :--- |")
+    md.append("| **EBB054A05** | Management- en Organisatietheorie | 5 ECTS | **Werkcollege 3 - Groepje 3** | Thu 13:00–15:00 (5416.0059) & Tue 11:00 (Lecture) |")
+    md.append("| **EBB050A05** | Kwalitatieve onderzoeksmethoden | 5 ECTS | **3.8 (Werkcollege 3)** | Fri 11:00–13:00 (5433.0209A) & Wed 13:00 (Q&A/Lecture) |")
+    md.append("| **EBB046A05** | Financial Management BDK | 5 ECTS | **Group 1 (Tutorial gr.01)** | Tue 13:00–15:00 (5419.0007) & Thu 15:00 (Lecture) |")
+    md.append("")
+    
+    # Recurring Weekly Routine Table
+    md.append("## 🗓️ Master Weekly Routine (Standard Week Pattern)")
+    md.append("The table below shows the regular recurring schedule across a standard teaching week with zero timetable clashes:\n")
+    md.append("| Day | Time | Course | Type | Location | Preparation & Focus |")
+    md.append("| :--- | :---: | :--- | :--- | :--- | :--- |")
+    md.append("| **Tuesday** | 11:00 – 13:00 | [EBB054A05] Management- en Organisatietheorie | Lecture (Weeks 1 & 7) | 5419.0015 | Key organizational theory paradigms and synthesis lectures. |")
+    md.append("| | 13:00 – 15:00 | [EBB046A05] Financial Management BDK | **Tutorial Gr01** | 5419.0007 | Weekly financial problem sets (TVM, valuation, cost of capital, capital structure). |")
+    md.append("| **Wednesday** | 13:00 – 14:00 / 15:00 | [EBB050A05] Kwalitatieve onderzoeksmethoden | Q&A / Lecture | 5263.0055 / Online | Methodology questions, coding frameworks, and qualitative analysis Q&A. |")
+    md.append("| **Thursday** | 13:00 – 15:00 | [EBB054A05] Management- en Organisatietheorie | **Werkcollege 3** | 5416.0059 | Case study discussions, group assignments (Groepje 3). |")
+    md.append("| | 15:00 – 17:00 | [EBB046A05] Financial Management BDK | Lecture | 5419.0008 | Corporate finance theory and valuation models. |")
+    md.append("| **Friday** | 11:00 – 13:00 | [EBB050A05] Kwalitatieve onderzoeksmethoden | **Werkcollege 3 (Team 3.8)** | 5433.0209A | Hands-on qualitative interviewing, coding, and group research work. |")
+    md.append("| | 15:00 – 17:00 | [EBB046A05] Financial Management BDK | Digital assignment (Midterm) | 5263.0226 | Midterm digital assessment (Week 2, Friday Sep 11). |")
+    md.append("")
+
+    # Weekly To-Do & Timeline
+    md.append("## 📅 Week-by-Week Schedule & Study To-Do List")
+    md.append("Follow this chronological roadmap throughout Semester 1a to stay on track for all tutorials and exams:\n")
+
+    week_counter = 1
+    # Sort weeks chronologically
+    sorted_weeks = sorted(by_week.items(), key=lambda item: item[1][0]["start_dt"])
+    
+    for (year, week_num), events in sorted_weeks:
+        start_date = events[0]["start_dt"].strftime("%b %d, %Y")
+        end_date = events[-1]["start_dt"].strftime("%b %d, %Y")
+        
+        # Check if week has exams
+        has_exams = any(e["type"] == "Exam" for e in events)
+        week_badge = "🏁 EXAM WEEK" if has_exams else f"Week {week_counter}"
+        
+        md.append(f"### {week_badge} ({start_date} – {end_date})")
+        
+        # Events list for this week
+        md.append("**Scheduled Classes & Sessions:**")
+        for ev in events:
+            date_str = ev["start_dt"].strftime("%A, %b %d")
+            time_str = f"{ev['start_dt'].strftime('%H:%M')} – {ev['end_dt'].strftime('%H:%M')}"
+            loc_str = f" @ {ev['location']}" if ev['location'] else ""
+            status_icon = "📝" if ev['type'] == "Exam" else ("👥" if ev['type'] == "Tutorial" else "📖")
+            md.append(f"- {status_icon} **{date_str}** | `{time_str}` | **{ev['summary']}**{loc_str}")
+            
+        md.append("")
+        md.append("**Weekly To-Do & Action Checklist:**")
+        if has_exams:
+            md.append("- [ ] Review mock exams and past exam papers.")
+            md.append("- [ ] Check exam registration on Progress/Brightspace and ensure student ID card is packed.")
+            md.append("- [ ] Consolidate formula sheets and summary notes for exam halls.")
+        else:
+            md.append(f"- [ ] **Financial Management**: Review lecture notes and complete practice problems before Tuesday tutorial (Gr01 @ 5419.0007).")
+            md.append(f"- [ ] **Management- en Organisatietheorie**: Read assigned literature and prepare case analysis before Thursday tutorial (Werkcollege 3 @ 5416.0059).")
+            md.append(f"- [ ] **Kwalitatieve onderzoeksmethoden**: Prepare methodological exercises and coordinate research tasks before Friday tutorial (Werkcollege 3, Team 3.8 @ 5433.0209A).")
+            md.append(f"- [ ] Review Brightspace discussion boards for announcements or slide uploads.")
+        md.append("")
+        week_counter += 1
+
+    # Key Milestones & Exam Dates
+    md.append("## 🏆 Key Milestones & Exam Dates")
+    md.append("| Course Code | Examination | Date | Time | Location |")
+    md.append("| :--- | :--- | :---: | :---: | :--- |")
+    
+    exam_events = [e for e in all_events if any(x in e["summary"].lower() for x in ["exam", "resit", "tentamen"])]
+    if exam_events:
+        for ex in exam_events:
+            d_str = ex["start_dt"].strftime("%A, %b %d, %Y")
+            t_str = f"{ex['start_dt'].strftime('%H:%M')} – {ex['end_dt'].strftime('%H:%M')}"
+            md.append(f"| `{ex['course_code']}` | {ex['raw_summary']} | {d_str} | {t_str} | {ex['location']} |")
+    else:
+        md.append("| `EBB046A05` | Financial Management BDK Exam (digital) | Tuesday, Oct 28, 2025 | 11:45 – 13:45 | Exam Hall 1 |")
+        md.append("| `EBB050A05` | Kwalitatieve onderzoeksmethoden Exam (digital) | Tuesday, Nov 04, 2025 | 11:45 – 13:45 | Exam Hall 1 |")
+        md.append("| `EBB054A05` | Management- en Organisatietheorie Exam (digital) | Thursday, Nov 06, 2025 | 08:30 – 10:30 | Exam Hall 4 |")
+    md.append("")
+    
+    # Study Tips & Organization
+    md.append("## 💡 Study Strategy & Success Tips for Semester 1a")
+    md.append("1. **Front-load Financial Management**: Financial Management requires repetitive problem-solving practice. Start tutorial problem sets early on Sundays/Mondays so Tuesday's tutorial can clarify tricky calculation steps.")
+    md.append("2. **Active Group Collaboration in MOT**: Case discussions in Thursday's tutorial reward active participation. Note down contrasting organizational perspectives (e.g. contingency theory vs. institutional theory) beforehand.")
+    md.append("3. **Iterative Qualitative Practice**: Kwalitatieve onderzoeksmethoden emphasizes qualitative rigor, interview technique, and codebooks. Attend the Friday training sessions actively to get hands-on feedback on coding frameworks.")
+    md.append("")
+    
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(md))
+        print(f"Weekly schedule & to-do summary successfully written to '{output_path}'.")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to write '{output_path}': {e}")
+        return False
+

@@ -3,6 +3,8 @@ import re
 import sys
 import io
 import urllib.parse
+import json
+from pathlib import Path
 from playwright.async_api import async_playwright
 from dotenv import load_dotenv
 
@@ -18,6 +20,7 @@ load_dotenv()
 BRIGHTSPACE_BASE_URL = os.getenv("BRIGHTSPACE_BASE_URL", "https://brightspace.rug.nl").rstrip("/")
 DOWNLOADS_DIR = os.getenv("DOWNLOADS_DIR", "downloads")
 AUTH_STATE_PATH = "auth_state.json"
+SYNC_ERRORS = []
 
 def sanitize_name(name):
     """
@@ -67,18 +70,18 @@ def parse_content_disposition(header):
     """
     if not header:
         return None
-    
+
     # Try filename* (UTF-8 encoding)
     utf8_match = re.search(r"filename\*=UTF-8''([^;\n]+)", header, re.IGNORECASE)
     if utf8_match:
         val = urllib.parse.unquote(utf8_match.group(1))
         return sanitize_name(val)
-        
+
     # Try normal filename
     normal_match = re.search(r'filename="?([^";\n]+)"?', header, re.IGNORECASE)
     if normal_match:
         return sanitize_name(normal_match.group(1))
-        
+
     return None
 
 async def scrape_and_download_html_links(request_context, html_content, dest_dir):
@@ -87,18 +90,18 @@ async def scrape_and_download_html_links(request_context, html_content, dest_dir
     then downloads each discovered file to dest_dir.
     Handles both relative (/content/enforced/...) and absolute (https://...) URLs.
     """
-    links = re.findall(r'href="([^"]+)"', html_content) + re.findall(r"href='([^']+)'", html_content)
-    
+    links = re.findall(r'(?:href|src)=["\x27]([^"\x27]+)["\x27]', html_content, re.IGNORECASE)
+
     for link in links:
         # Normalize HTML entities
         normalized = link.replace("&amp;", "&")
-        
+
         is_coursefile = "type=coursefile" in normalized
         is_enforced = "/content/enforced/" in normalized
-        
+
         if not (is_coursefile or is_enforced):
             continue
-        
+
         # Determine filename from the URL
         filename = None
         if is_coursefile:
@@ -112,18 +115,24 @@ async def scrape_and_download_html_links(request_context, html_content, dest_dir
             parsed_path = urllib.parse.urlparse(normalized).path
             raw_name = urllib.parse.unquote(parsed_path)
             filename = sanitize_name(os.path.basename(raw_name))
-        
+
         if not filename or filename == "unnamed":
             continue
-        
+
         dest_path = os.path.join(dest_dir, filename)
-        
+        response = None
         try:
+            if filename.lower().endswith('.mp4') and os.path.exists(dest_path):
+                head = await request_context.head(normalized)
+                expected = int(head.headers.get('content-length', 0))
+                await head.dispose()
+                if expected and os.path.getsize(dest_path) == expected:
+                    continue
             response = await request_context.get(normalized, timeout=600000)
             if response.status == 200:
                 content = await response.body()
                 content_size = len(content)
-                
+
                 # If filename has no extension, try to determine one from the response
                 if not os.path.splitext(filename)[1]:
                     cd_header = response.headers.get("content-disposition", "")
@@ -137,18 +146,23 @@ async def scrape_and_download_html_links(request_context, html_content, dest_dir
                         if ext:
                             filename = filename + ext
                     dest_path = os.path.join(dest_dir, filename)
-                
+
                 # Check if file exists and has same size
-                if os.path.exists(dest_path) and os.path.getsize(dest_path) == content_size:
+                if os.path.exists(dest_path) and Path(dest_path).read_bytes() == content:
                     continue
                 os.makedirs(dest_dir, exist_ok=True)
                 with open(dest_path, "wb") as f:
                     f.write(content)
                 print(f"  [Scraped Download] {filename} ({content_size / 1024:.1f} KB)")
             else:
+                SYNC_ERRORS.append(f"HTTP {response.status}: {normalized}")
                 print(f"  [Warning] HTTP {response.status} for scraped link: {filename}")
         except Exception as e:
+            SYNC_ERRORS.append(f"{normalized}: {e}")
             print(f"  [Warning] Failed to download scraped link '{filename}': {e}")
+        finally:
+            if response is not None:
+                await response.dispose()
 
 async def download_topic(request_context, course_id, topic, course_dir):
     """
@@ -159,39 +173,40 @@ async def download_topic(request_context, course_id, topic, course_dir):
     topic_id = topic.get("TopicId")
     topic_title = topic.get("Title", f"topic_{topic_id}")
     topic_url = topic.get("Url", "")
-    
+
     # constructed API endpoint to fetch the topic file
     download_url = f"/d2l/api/le/1.26/{course_id}/content/topics/{topic_id}/file"
-    
+
     try:
         # Perform GET request to download the file (with 10-minute timeout for large files)
         response = await request_context.get(download_url, timeout=600000)
         if response.status != 200:
+            SYNC_ERRORS.append(f"HTTP {response.status}: topic {topic_id}")
             print(f"  [Failed] HTTP {response.status} for topic: {topic_title}")
             return
-            
+
         # Determine the filename
         # 1. Try Content-Disposition header
         cd_header = response.headers.get("content-disposition")
         filename = parse_content_disposition(cd_header)
-        
+
         # 2. Fall back to topic Title + extension from Url or Content-Type
         if not filename:
             ext = get_extension_from_url(topic_url)
             if not ext:
                 ext = get_extension_from_content_type(response.headers.get("content-type", ""))
             filename = sanitize_name(topic_title) + ext
-            
+
         dest_path = os.path.join(course_dir, filename)
-        
+
         # Read the file contents
         content = await response.body()
         content_size = len(content)
-        
+
         # Check if file already exists locally and has the same size
         if os.path.exists(dest_path):
             local_size = os.path.getsize(dest_path)
-            if local_size == content_size:
+            if local_size == content_size and Path(dest_path).read_bytes() == content:
                 # Same file size, skip download to optimize speed and network
                 pass
             else:
@@ -206,15 +221,16 @@ async def download_topic(request_context, course_id, topic, course_dir):
             with open(dest_path, "wb") as f:
                 f.write(content)
             print(f"  [Downloaded] {filename} ({content_size / 1024:.1f} KB)")
-        
+
         # If the topic is a small HTML redirect/wrapper page, also scrape it for
         # embedded links to actual course files (e.g. /content/enforced/ or coursefile links).
         content_type = response.headers.get("content-type", "").lower()
-        if "html" in content_type and content_size < 50000:
+        if "html" in content_type:
             html_text = content.decode("utf-8", errors="replace")
             await scrape_and_download_html_links(request_context, html_text, course_dir)
-        
+
     except Exception as e:
+        SYNC_ERRORS.append(f"topic {topic_id}: {e}")
         print(f"  [Error] Failed to download topic {topic_title} ({topic_id}): {e}")
 
 async def walk_module(request_context, course_id, module, current_path):
@@ -223,20 +239,29 @@ async def walk_module(request_context, course_id, module, current_path):
     """
     # Create the directory for the current module level
     os.makedirs(current_path, exist_ok=True)
-    
+
     # 1. Download files directly in this module
     topics = module.get("Topics", [])
     for topic in topics:
         # TypeIdentifier "File" or ActivityType 1 represents a File topic (e.g. PDF, Word, PowerPoint)
         if topic.get("TypeIdentifier") == "File" or topic.get("ActivityType") == 1:
             await download_topic(request_context, course_id, topic, current_path)
-            
+        else:
+            # Keep external videos, quizzes and other activities in the offline index.
+            title = sanitize_name(topic.get("Title", "Activity"))
+            target = urllib.parse.urljoin(BRIGHTSPACE_BASE_URL, topic.get("Url") or
+                f"/d2l/le/content/{course_id}/viewContent/{topic.get('TopicId')}/View")
+            Path(current_path, f"{title} - {topic.get('TopicId')}.md").write_text(
+                f"# {topic.get('Title', 'Activity')}\n\n[Open in Brightspace or provider]({target})\n",
+                encoding="utf-8")
+
     # 1.5. Scrape and download files linked in the module's description HTML
     # (e.g. quicklinks or /content/enforced/ paths embedded by instructors)
     desc_dict = module.get("Description")
     if desc_dict and desc_dict.get("Html"):
+        Path(current_path, "module-description.html").write_text(desc_dict["Html"], encoding="utf-8")
         await scrape_and_download_html_links(request_context, desc_dict.get("Html"), current_path)
-            
+
     # 2. Traverse submodules recursively
     sub_modules = module.get("Modules", [])
     for sub_mod in sub_modules:
@@ -244,15 +269,17 @@ async def walk_module(request_context, course_id, module, current_path):
         sub_path = os.path.join(current_path, sub_mod_title)
         await walk_module(request_context, course_id, sub_mod, sub_path)
 
-async def sync_files():
+async def sync_files(target_courses=None):
     """
-    Fetches all active courses and syncs their table of contents files to the local folder.
+    Fetches courses and syncs their table of contents files to the local folder.
+    If target_courses is specified, only matching courses will be downloaded.
     """
+    SYNC_ERRORS.clear()
     if not os.path.exists(AUTH_STATE_PATH):
         print(f"[ERROR] Session state file '{AUTH_STATE_PATH}' not found.")
         print("Please run `python sync.py login` first to log in and create this session.")
         return False
-        
+
     print("Initializing sync process...")
     async with async_playwright() as p:
         try:
@@ -261,72 +288,164 @@ async def sync_files():
                 base_url=BRIGHTSPACE_BASE_URL,
                 storage_state=AUTH_STATE_PATH
             )
-            
+
             # 1. Fetch courses
             print("Fetching enrollments...")
             courses = []
             url = "/d2l/api/lp/1.26/enrollments/myenrollments/"
-            
+
             while url:
                 response = await request_context.get(url)
                 if response.status != 200:
                     print(f"[ERROR] Failed to fetch enrollments (HTTP {response.status}). Session may have expired.")
                     print("Please run `python sync.py login` to refresh your login state.")
                     return False
-                    
+
                 data = await response.json()
                 for item in data.get("Items", []):
                     org_unit = item.get("OrgUnit", {})
                     access = item.get("Access", {})
                     # Type ID 3 represents Course Offerings
                     if org_unit.get("Type", {}).get("Id") == 3 and access.get("CanAccess", True):
+                        c_name = org_unit.get("Name", "")
+                        c_code = org_unit.get("Code", "")
+
+                        # Filter if target_courses is specified
+                        if target_courses:
+                            matches = False
+                            for target in target_courses:
+                                if (target.lower() in c_name.lower()) or (c_code and target.lower() in c_code.lower()):
+                                    matches = True
+                                    break
+                            if not matches:
+                                continue
+
                         courses.append({
                             "id": org_unit.get("Id"),
-                            "name": org_unit.get("Name"),
-                            "code": org_unit.get("Code")
+                            "name": c_name,
+                            "code": c_code
                         })
-                
+
                 # Check for next page of enrollments
                 url = data.get("Next")
                 if url and url.startswith(BRIGHTSPACE_BASE_URL):
                     url = url[len(BRIGHTSPACE_BASE_URL):]
-            
+
             print(f"Found {len(courses)} active course(s). Starting content sync...")
-            
+            if target_courses:
+                for target in target_courses:
+                    if not any(target.lower() in (c['name']+' '+c['code']).lower() for c in courses):
+                        SYNC_ERRORS.append(f"No matching accessible course: {target}")
+
             # Create root downloads directory
             os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-            
+
             # 2. Sync each course
             for course in courses:
                 course_id = course["id"]
                 course_name = sanitize_name(course["name"])
                 print(f"\nSyncing: {course['name']} ({course['code']})")
-                
+
                 course_dir = os.path.join(DOWNLOADS_DIR, course_name)
-                
+
                 # Fetch Table of Contents for this course
                 toc_url = f"/d2l/api/le/1.26/{course_id}/content/toc"
                 toc_response = await request_context.get(toc_url)
-                
+
                 if toc_response.status != 200:
+                    SYNC_ERRORS.append(f"HTTP {toc_response.status}: TOC {course_id}")
                     print(f"  [Warning] Could not fetch Table of Contents (HTTP {toc_response.status})")
                     continue
-                    
+
                 toc_data = await toc_response.json()
-                
+                os.makedirs(course_dir, exist_ok=True)
+                Path(course_dir, "course-content.json").write_text(
+                    json.dumps({"course": course, "toc": toc_data}, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+
                 # Walk the TOC modules and download files
                 modules = toc_data.get("Modules", [])
                 for module in modules:
                     mod_title = sanitize_name(module.get("Title", "Untitled Module"))
                     mod_path = os.path.join(course_dir, mod_title)
                     await walk_module(request_context, course_id, module, mod_path)
-                    
-            print("\nFile sync complete!")
-            return True
-            
+
+            Path(DOWNLOADS_DIR, 'sync-status.json').write_text(json.dumps(
+                {'courses': courses, 'errors': SYNC_ERRORS, 'complete': not SYNC_ERRORS},
+                ensure_ascii=False, indent=2), encoding='utf-8')
+            print("\nFile sync complete!" if not SYNC_ERRORS else "\nFile sync finished with errors; see sync-status.json")
+            generate_materials_index(DOWNLOADS_DIR)
+            return not SYNC_ERRORS
+
         except Exception as e:
             print(f"\n[ERROR] An error occurred during file sync: {e}")
             return False
+
+def generate_materials_index(downloads_dir=DOWNLOADS_DIR, output_file=None):
+    """
+    Scans the downloads directory and creates a clean, sorted index of all course materials.
+    """
+    if not os.path.exists(downloads_dir):
+        return
+
+    if not output_file:
+        output_file = os.path.join(downloads_dir, "materials_index.md")
+
+    md = []
+    md.append("# 📚 Downloaded Course Materials & Resources Index")
+    md.append(f"*Indexed on {os.path.basename(downloads_dir)}*\n")
+
+    total_files = 0
+    total_bytes = 0
+    course_folders = [d for d in os.listdir(downloads_dir) if os.path.isdir(os.path.join(downloads_dir, d))]
+
+    for cfolder in sorted(course_folders):
+        cpath = os.path.join(downloads_dir, cfolder)
+        md.append(f"## 📁 {cfolder}\n")
+
+        file_list = []
+        for root, _, files in os.walk(cpath):
+            for file in files:
+                fpath = os.path.join(root, file)
+                rel_path = os.path.relpath(fpath, cpath)
+                fsize = os.path.getsize(fpath)
+                ext = os.path.splitext(file)[1].lower()
+                file_list.append((rel_path, fsize, ext))
+                total_files += 1
+                total_bytes += fsize
+
+        if not file_list:
+            md.append("*No files found in this course directory.*\n")
+            continue
+
+        md.append("| File / Path | Type | Size |")
+        md.append("| :--- | :---: | :---: |")
+        for rel_path, fsize, ext in sorted(file_list, key=lambda x: x[0].lower()):
+            size_str = f"{fsize / 1024:.1f} KB" if fsize < 1024 * 1024 else f"{fsize / (1024 * 1024):.1f} MB"
+            type_icon = "📄"
+            if ext == ".pdf":
+                type_icon = "📕 PDF"
+            elif ext in (".pptx", ".ppt"):
+                type_icon = "📊 Slides"
+            elif ext in (".docx", ".doc"):
+                type_icon = "📝 Word"
+            elif ext in (".xlsx", ".xls"):
+                type_icon = "📈 Excel"
+            elif ext == ".zip":
+                type_icon = "📦 Archive"
+            absolute = Path(cpath, rel_path).resolve().as_posix()
+            md.append(f"| [{rel_path}](<{absolute}>) | {type_icon} | {size_str} |")
+        md.append("")
+
+    summary_header = f"**Total Downloaded Materials**: {total_files} file(s) ({total_bytes / (1024 * 1024):.2f} MB)\n"
+    md.insert(2, summary_header)
+
+    try:
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(md))
+        print(f"Materials index written to '{output_file}'.")
+    except Exception as e:
+        print(f"[Warning] Failed to write materials index: {e}")
 
 if __name__ == "__main__":
     import asyncio

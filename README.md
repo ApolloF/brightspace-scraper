@@ -119,3 +119,17 @@ git remote add origin <paste-your-copied-github-url>
 # Push the code to the main branch
 git push -u origin main
 ```
+
+
+## Semester 1a materials and study checklist (8 September 2026)
+
+`recommended_weekly_todo.md` combines the local group-filtered calendar with course instructions and assignment dates. It includes exact FM exercises, KOM project milestones, M&OT handbook deadlines, and links to materials. The weekly recommendations and handbook dates in `build_study_plan.py` are a reviewed snapshot, not automatically refreshed interpretations of future uploads.
+
+```powershell
+.\.venv\Scripts\python.exe -u sync.py files EBB050A05 EBB046A05 EBB054A05
+.\.venv\Scripts\python.exe -u fetch_study_sources.py
+.\.venv\Scripts\python.exe -u download_embedded_media.py
+.\.venv\Scripts\python.exe build_study_plan.py
+```
+
+Materials retain Brightspace course/module folders. `course-content.json` preserves each course TOC; HTML module descriptions and external activity links are retained. `downloads/materials_index.md` provides clickable file links. `download_embedded_media.py` streams same-origin videos with three workers and checks lengths; unfinished files have `.part` extensions. External LTI videos remain links. `fetch_study_sources.py` saves HTTP status alongside the source data, so an unavailable API is not mistaken for an empty result. Google Docs worksheet exports from weeks 1 and 2 were also saved during this run.
